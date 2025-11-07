@@ -46,6 +46,7 @@
 #include <libimobiledevice/installation_proxy.h>
 #include <libimobiledevice/sbservices.h>
 #include <libimobiledevice/diagnostics_relay.h>
+#include <libimobiledevice-glue/sha.h>
 #include <libimobiledevice-glue/utils.h>
 #include <plist/plist.h>
 
@@ -105,6 +106,75 @@ enum cmd_flags {
 };
 
 static int backup_domain_changed = 0;
+
+struct mb2_partial_entry {
+	char *path;
+	int required;
+	int is_target;
+	int target_group;
+	int received;
+};
+
+static struct mb2_partial_entry *mb2_partial_entries = NULL;
+static size_t mb2_partial_entry_count = 0;
+static int mb2_partial_mode_active = 0;
+static int mb2_partial_cancel_sent = 0;
+static int *mb2_partial_target_group_received = NULL;
+static size_t mb2_partial_target_group_count = 0;
+static int mb2_partial_last_run_success = 0;
+static int mb2_partial_stop_requested = 0;
+
+static char* json_escape_string(const char *input)
+{
+	if (!input) {
+		return strdup("");
+	}
+	size_t len = strlen(input);
+	size_t extra = 0;
+	for (size_t i = 0; i < len; i++) {
+		unsigned char c = (unsigned char)input[i];
+		if (c == '\"' || c == '\\') {
+			extra++;
+		} else if (c <= 0x1F) {
+			extra += 5;
+		}
+	}
+	size_t out_len = len + extra;
+	char *out = (char*)malloc(out_len + 1);
+	if (!out) {
+		return NULL;
+	}
+	size_t pos = 0;
+	for (size_t i = 0; i < len; i++) {
+		unsigned char c = (unsigned char)input[i];
+		if (c == '\"' || c == '\\') {
+			out[pos++] = '\\';
+			out[pos++] = (char)c;
+		} else if (c <= 0x1F) {
+			static const char hex[] = "0123456789abcdef";
+			out[pos++] = '\\';
+			out[pos++] = 'u';
+			out[pos++] = '0';
+			out[pos++] = '0';
+			out[pos++] = hex[(c >> 4) & 0xF];
+			out[pos++] = hex[c & 0xF];
+		} else {
+			out[pos++] = (char)c;
+		}
+	}
+	out[pos] = '\0';
+	return out;
+}
+
+static void mb2_partial_free_entries(void);
+static char* mb2_partial_join_device_path(const char *udid, const char *suffix);
+static void mb2_partial_prepare(const char *udid);
+static void mb2_partial_cleanup(void);
+static int mb2_partial_should_keep_file(const char *fname, struct mb2_partial_entry **entry_out);
+static void mb2_partial_mark_received(mobilebackup2_client_t client, struct mb2_partial_entry *entry);
+static int mb2_partial_requirements_met(void);
+static void mb2_partial_send_cancel(mobilebackup2_client_t client);
+static int mb2_partial_was_successful(void);
 
 static void notify_cb(const char *notification, void *userdata)
 {
@@ -168,6 +238,313 @@ static void mobilebackup_afc_get_file_contents(afc_client_t afc, const char *fil
 		free(buf);
 	}
 	afc_file_close(afc, f);
+}
+
+static void mb2_partial_free_entries(void)
+{
+	if (!mb2_partial_entries) {
+		return;
+	}
+	for (size_t i = 0; i < mb2_partial_entry_count; i++) {
+		free(mb2_partial_entries[i].path);
+		mb2_partial_entries[i].path = NULL;
+	}
+	free(mb2_partial_entries);
+	mb2_partial_entries = NULL;
+	mb2_partial_entry_count = 0;
+}
+
+static char* mb2_partial_join_device_path(const char *udid, const char *suffix)
+{
+	if (!udid || !suffix) {
+		return NULL;
+	}
+	size_t len = strlen(udid) + 1 + strlen(suffix) + 1;
+	char *out = (char*)malloc(len);
+	if (!out) {
+		return NULL;
+	}
+	snprintf(out, len, "%s/%s", udid, suffix);
+	return out;
+}
+
+struct mb2_partial_file_spec {
+	const char *domain;
+	const char *relative_path;
+	int required;
+};
+
+static const struct mb2_partial_file_spec mb2_partial_file_specs[] = {
+	{ "HomeDomain", "Library/SMS/sms.db", 1 },
+	{ "HomeDomain", "Library/SMS/chat.db", 0 },
+	{ "HomeDomain", "Library/Messages/chat.db", 0 },
+	{ "HomeDomain", "Library/AddressBook/AddressBook.sqlitedb", 1 },
+	{ "HomeDomain", "Library/AddressBook/AddressBookImages.sqlitedb", 0 }
+};
+
+static void mb2_partial_emit_event(const char *remote_path, const char *local_path, struct mb2_partial_entry *entry)
+{
+	struct mb2_partial_file_spec anon_spec = { NULL, NULL, 0 };
+	if (!entry && remote_path) {
+		anon_spec.domain = "";
+		anon_spec.relative_path = remote_path;
+		anon_spec.required = 0;
+		entry = &anon_spec;
+	}
+	const struct mb2_partial_file_spec *spec = NULL;
+	if (entry && entry->is_target && entry->target_group >= 0) {
+		if ((size_t)entry->target_group < (sizeof(mb2_partial_file_specs) / sizeof(mb2_partial_file_specs[0]))) {
+			spec = &mb2_partial_file_specs[entry->target_group];
+		}
+	}
+
+	char *remote_escaped = json_escape_string(remote_path);
+	char *local_escaped = json_escape_string(local_path);
+	char *relative_escaped = json_escape_string(spec ? spec->relative_path : NULL);
+
+	printf("ISUS_PARTIAL_JSON:{\"remote\":\"%s\",\"local\":\"%s\"", remote_escaped ? remote_escaped : "", local_escaped ? local_escaped : "");
+	if (spec && spec->relative_path && relative_escaped) {
+		printf(",\"relative\":\"%s\"", relative_escaped);
+	}
+	printf("}\n");
+	fflush(stdout);
+
+	free(remote_escaped);
+	free(local_escaped);
+	free(relative_escaped);
+}
+
+static int mb2_partial_compute_manifest_hash(const char *domain, const char *relative_path, char out[43])
+{
+	if (!domain || !relative_path || !out) {
+		return -1;
+	}
+
+	sha1_context ctx;
+	unsigned char digest[20];
+	static const char hex[] = "0123456789abcdef";
+	char full_hash[41];
+
+	sha1_init(&ctx);
+	sha1_update(&ctx, (const unsigned char*)domain, (unsigned int)strlen(domain));
+	sha1_update(&ctx, (const unsigned char*)"-", 1);
+	sha1_update(&ctx, (const unsigned char*)relative_path, (unsigned int)strlen(relative_path));
+	sha1_final(&ctx, digest);
+
+	for (size_t i = 0; i < sizeof(digest); i++) {
+		full_hash[i * 2] = hex[(digest[i] >> 4) & 0xF];
+		full_hash[i * 2 + 1] = hex[digest[i] & 0xF];
+	}
+	full_hash[40] = '\0';
+
+	out[0] = full_hash[0];
+	out[1] = full_hash[1];
+	out[2] = '/';
+	memcpy(out + 3, full_hash, 40);
+	out[43] = '\0';
+
+	return 0;
+}
+
+static void mb2_partial_prepare(const char *udid)
+{
+	const char *core_suffixes[] = { "Manifest.db", "Manifest.plist", "Status.plist" };
+	size_t target_spec_count = sizeof(mb2_partial_file_specs) / sizeof(mb2_partial_file_specs[0]);
+
+	mb2_partial_last_run_success = 0;
+	mb2_partial_cancel_sent = 0;
+
+	if (!udid) {
+		mb2_partial_mode_active = 0;
+		mb2_partial_free_entries();
+		free(mb2_partial_target_group_received);
+		mb2_partial_target_group_received = NULL;
+		mb2_partial_target_group_count = 0;
+		return;
+	}
+
+	mb2_partial_mode_active = 1;
+	mb2_partial_free_entries();
+	free(mb2_partial_target_group_received);
+	mb2_partial_target_group_received = NULL;
+	mb2_partial_target_group_count = 0;
+
+	size_t core_count = sizeof(core_suffixes) / sizeof(core_suffixes[0]);
+	size_t total = core_count + (target_spec_count * 2);
+
+	mb2_partial_entries = (struct mb2_partial_entry*)calloc(total, sizeof(struct mb2_partial_entry));
+	if (!mb2_partial_entries) {
+		mb2_partial_entry_count = 0;
+		mb2_partial_mode_active = 0;
+		return;
+	}
+
+	size_t idx = 0;
+	for (size_t i = 0; i < core_count; i++) {
+		char *path = mb2_partial_join_device_path(udid, core_suffixes[i]);
+		if (!path) {
+			continue;
+		}
+		mb2_partial_entries[idx].path = path;
+		/* We no longer require Manifest.db before allowing an early cancel. */
+		mb2_partial_entries[idx].required = 0;
+		mb2_partial_entries[idx].is_target = 0;
+		mb2_partial_entries[idx].target_group = -1;
+		mb2_partial_entries[idx].received = 0;
+		idx++;
+	}
+	for (size_t i = 0; i < target_spec_count; i++) {
+		char hash_path[44];
+		if (mb2_partial_compute_manifest_hash(mb2_partial_file_specs[i].domain, mb2_partial_file_specs[i].relative_path, hash_path) != 0) {
+			continue;
+		}
+
+		char *path = mb2_partial_join_device_path(udid, hash_path);
+		if (path) {
+			mb2_partial_entries[idx].path = path;
+			mb2_partial_entries[idx].required = 0;
+			mb2_partial_entries[idx].is_target = 1;
+			mb2_partial_entries[idx].target_group = (int)i;
+			mb2_partial_entries[idx].received = 0;
+			idx++;
+		}
+
+		char snapshot_path_buf[512];
+		snprintf(snapshot_path_buf, sizeof(snapshot_path_buf), "Snapshot/%s", hash_path);
+		char *snapshot_path = mb2_partial_join_device_path(udid, snapshot_path_buf);
+		if (snapshot_path) {
+			mb2_partial_entries[idx].path = snapshot_path;
+			mb2_partial_entries[idx].required = 0;
+			mb2_partial_entries[idx].is_target = 1;
+			mb2_partial_entries[idx].target_group = (int)i;
+			mb2_partial_entries[idx].received = 0;
+			idx++;
+		}
+	}
+	mb2_partial_entry_count = idx;
+	mb2_partial_target_group_count = target_spec_count;
+	if (mb2_partial_target_group_count > 0) {
+		mb2_partial_target_group_received = (int*)calloc(mb2_partial_target_group_count, sizeof(int));
+		if (!mb2_partial_target_group_received) {
+			mb2_partial_target_group_count = 0;
+		} else {
+			for (size_t i = 0; i < mb2_partial_target_group_count; i++) {
+				if (!mb2_partial_file_specs[i].required) {
+					mb2_partial_target_group_received[i] = 1;
+				}
+			}
+		}
+	}
+
+	PRINT_VERBOSE(2, "Partial backup tracking %zu file(s)\n", mb2_partial_entry_count);
+}
+
+static void mb2_partial_cleanup(void)
+{
+	mb2_partial_mode_active = 0;
+	mb2_partial_cancel_sent = 0;
+	mb2_partial_last_run_success = 0;
+	mb2_partial_stop_requested = 0;
+	if (mb2_partial_target_group_received) {
+		free(mb2_partial_target_group_received);
+		mb2_partial_target_group_received = NULL;
+	}
+	mb2_partial_target_group_count = 0;
+	mb2_partial_free_entries();
+}
+
+static int mb2_partial_should_keep_file(const char *fname, struct mb2_partial_entry **entry_out)
+{
+	if (entry_out) {
+		*entry_out = NULL;
+	}
+	if (!mb2_partial_mode_active || !fname) {
+		return 1;
+	}
+	for (size_t i = 0; i < mb2_partial_entry_count; i++) {
+		if (mb2_partial_entries[i].path && strcmp(fname, mb2_partial_entries[i].path) == 0) {
+			if (entry_out) {
+				*entry_out = &mb2_partial_entries[i];
+			}
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static int mb2_partial_requirements_met(void)
+{
+	if (!mb2_partial_mode_active) {
+		return 0;
+	}
+	for (size_t i = 0; i < mb2_partial_entry_count; i++) {
+		if (mb2_partial_entries[i].required && !mb2_partial_entries[i].received) {
+			return 0;
+		}
+	}
+	if (mb2_partial_target_group_count > 0) {
+		for (size_t i = 0; i < mb2_partial_target_group_count; i++) {
+			if (!mb2_partial_target_group_received || !mb2_partial_target_group_received[i]) {
+				return 0;
+			}
+		}
+	}
+	return 1;
+}
+
+static void mb2_partial_send_cancel(mobilebackup2_client_t client)
+{
+	if (!client || mb2_partial_cancel_sent) {
+		return;
+	}
+
+	plist_t array = plist_new_array();
+	plist_array_append_item(array, plist_new_string("DLMessageCancel"));
+	plist_array_append_item(array, plist_new_string("___EmptyParameterString___"));
+
+	char *payload = NULL;
+	uint32_t payload_size = 0;
+	plist_to_bin(array, &payload, &payload_size);
+	plist_free(array);
+
+	if (!payload || payload_size == 0) {
+		free(payload);
+		return;
+	}
+
+	uint32_t header = htobe32(payload_size);
+	uint32_t sent = 0;
+	if (mobilebackup2_send_raw(client, (const char*)&header, sizeof(header), &sent) == MOBILEBACKUP2_E_SUCCESS) {
+		mobilebackup2_send_raw(client, payload, payload_size, &sent);
+		mb2_partial_cancel_sent = 1;
+		PRINT_VERBOSE(1, "Partial backup: requested early cancellation.\n");
+	}
+	free(payload);
+}
+
+static void mb2_partial_mark_received(mobilebackup2_client_t client, struct mb2_partial_entry *entry)
+{
+	if (!mb2_partial_mode_active || !entry) {
+		return;
+	}
+	entry->received = 1;
+	if (entry->is_target) {
+		if (entry->target_group >= 0 &&
+		    mb2_partial_target_group_received &&
+		    (size_t)entry->target_group < mb2_partial_target_group_count) {
+			mb2_partial_target_group_received[entry->target_group] = 1;
+		}
+	}
+	if (!mb2_partial_last_run_success && mb2_partial_requirements_met()) {
+		mb2_partial_last_run_success = 1;
+		mb2_partial_stop_requested = 1;
+		mb2_partial_send_cancel(client);
+	}
+}
+
+static int mb2_partial_was_successful(void)
+{
+	return mb2_partial_last_run_success;
 }
 
 static int __mkdir(const char* path, int mode)
@@ -847,6 +1224,11 @@ static int mb2_handle_send_file(mobilebackup2_client_t mobilebackup2, const char
 
 	sent = 0;
 	do {
+		if (mb2_partial_stop_requested && !quit_flag) {
+			quit_flag++;
+		}
+		if (quit_flag)
+			break;
 		length = ((total-sent) < (long long)sizeof(buf)) ? (uint32_t)total-sent : (uint32_t)sizeof(buf);
 		/* send data size (file size + 1) */
 		nlen = htobe32(length+1);
@@ -1043,7 +1425,11 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 		PRINT_VERBOSE(1, "Receiving files\n");
 	}
 
+	int last_keep_file = 0;
+
 	do {
+		errcode = 0;
+		errdesc = NULL;
 		if (quit_flag)
 			break;
 
@@ -1061,6 +1447,17 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 			free(bname);
 			bname = NULL;
 		}
+
+		struct mb2_partial_entry *partial_entry = NULL;
+		int keep_file = mb2_partial_should_keep_file(fname, &partial_entry);
+		PRINT_VERBOSE(1, "Partial backup candidate: domain='%s' path='%s' keep=%d\n",
+			dname ? dname : "(null)",
+			fname ? fname : "(null)",
+			keep_file);
+		if (!keep_file && mb2_partial_mode_active) {
+			PRINT_VERBOSE(2, "Partial backup: skipping %s\n", fname);
+		}
+		last_keep_file = keep_file;
 
 		bname = string_build_path(backup_dir, fname, NULL);
 
@@ -1092,9 +1489,19 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 			PRINT_VERBOSE(1, "Found new flag %02x\n", code);
 		}
 
-		remove_file(bname);
-		f = fopen(bname, "wb");
-		while (f && (code == CODE_FILE_DATA)) {
+		if (keep_file) {
+			remove_file(bname);
+			f = fopen(bname, "wb");
+			if (!f) {
+				errcode = errno_to_device_error(errno);
+				errdesc = strerror(errno);
+				printf("Error opening '%s' for writing: %s\n", bname, errdesc);
+			}
+		} else {
+			f = NULL;
+		}
+
+		while (code == CODE_FILE_DATA) {
 			blocksize = nlen-1;
 			bdone = 0;
 			rlen = 0;
@@ -1108,13 +1515,15 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 				if ((int)r <= 0) {
 					break;
 				}
-				fwrite(buf, 1, r, f);
+				if (keep_file && f) {
+					fwrite(buf, 1, r, f);
+				}
 				bdone += r;
 			}
-			if (bdone == blocksize) {
+			if (keep_file && f && (bdone == blocksize)) {
 				backup_real_size += blocksize;
 			}
-			if (backup_total_size > 0) {
+			if (backup_total_size > 0 && keep_file) {
 				print_progress(backup_real_size, backup_total_size);
 			}
 			if (quit_flag)
@@ -1129,14 +1538,35 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 				break;
 			}
 		}
-		if (f) {
-			fclose(f);
-			file_count++;
+		if (keep_file) {
+				if (f) {
+					fclose(f);
+					f = NULL;
+					file_count++;
+					if (partial_entry && partial_entry->is_target) {
+						const char *remote_path = partial_entry->path ? partial_entry->path : "";
+						PRINT_VERBOSE(1, "ISUS partial file saved: remote='%s' local='%s'\n",
+							remote_path,
+							bname ? bname : "");
+						mb2_partial_emit_event(remote_path, bname ? bname : "", partial_entry);
+					}
+					mb2_partial_mark_received(mobilebackup2, partial_entry);
+					if (mb2_partial_stop_requested) {
+						quit_flag++;
+						break;
+					}
+				} else {
+					if (errcode == 0) {
+						errcode = errno_to_device_error(errno);
+					errdesc = strerror(errno);
+				}
+				break;
+			}
 		} else {
-			errcode = errno_to_device_error(errno);
-			errdesc = strerror(errno);
-			printf("Error opening '%s' for writing: %s\n", bname, errdesc);
-			break;
+			if (f) {
+				fclose(f);
+				f = NULL;
+			}
 		}
 		if (nlen == 0) {
 			break;
@@ -1165,7 +1595,9 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 		fname = (char*)malloc(nlen-1);
 		mobilebackup2_receive_raw(mobilebackup2, fname, nlen-1, &r);
 		free(fname);
-		remove_file(bname);
+		if (last_keep_file) {
+			remove_file(bname);
+		}
 	}
 
 	/* clean up */
@@ -2043,6 +2475,7 @@ checkpoint:
 				PRINT_VERBOSE(1, "Backup will be unencrypted.\n");
 			}
 			PRINT_VERBOSE(1, "Requesting backup from device...\n");
+			mb2_partial_prepare(udid);
 			err = mobilebackup2_send_request(mobilebackup2, "Backup", udid, source_udid, opts);
 			if (opts)
 				plist_free(opts);
@@ -2063,6 +2496,7 @@ checkpoint:
 					}
 				}
 			} else {
+				mb2_partial_cleanup();
 				if (err == MOBILEBACKUP2_E_BAD_VERSION) {
 					printf("ERROR: Could not start backup process: backup protocol version mismatch!\n");
 				} else if (err == MOBILEBACKUP2_E_REPLY_NOT_OK) {
@@ -2496,10 +2930,17 @@ checkpoint:
 						plist_get_string_val(nn, &str);
 					}
 					if (error_code != 0) {
-						if (str) {
-							printf("ErrorCode %d: %s\n", error_code, str);
+						if (mb2_partial_was_successful() && (error_code == 205 || error_code == 104)) {
+							PRINT_VERBOSE(2, "Ignoring MBErrorDomain/%d due to partial backup completion.\n", error_code);
+							error_code = 0;
+							result_code = 0;
+							operation_ok = 1;
 						} else {
-							printf("ErrorCode %d: (Unknown)\n", error_code);
+							if (str) {
+								printf("ErrorCode %d: %s\n", error_code, str);
+							} else {
+								printf("ErrorCode %d: (Unknown)\n", error_code);
+							}
 						}
 					}
 					if (str) {
@@ -2546,6 +2987,14 @@ files_out:
 
 			plist_free(message);
 			free(dlmsg);
+
+			if (cmd == CMD_BACKUP) {
+				if (mb2_partial_was_successful()) {
+					operation_ok = 1;
+					result_code = 0;
+				}
+				mb2_partial_cleanup();
+			}
 
 			/* report operation status to user */
 			switch (cmd) {
@@ -2685,4 +3134,3 @@ files_out:
 
 	return result_code;
 }
-
