@@ -2745,18 +2745,24 @@ checkpoint:
 					/* device wants to know how much disk space is available on the computer */
 					uint64_t freespace = 0;
 					int res = -1;
-#ifdef _WIN32
-					if (GetDiskFreeSpaceEx(backup_directory, (PULARGE_INTEGER)&freespace, NULL, NULL)) {
+					if (mb2_partial_mode_active) {
+						/* Advertise a synthetic “huge” disk so iOS never blocks our partial backups on host storage. */
+						freespace = ((uint64_t)1 << 62); /* ~4 exabytes */
 						res = 0;
-					}
+					} else {
+#ifdef _WIN32
+						if (GetDiskFreeSpaceEx(backup_directory, (PULARGE_INTEGER)&freespace, NULL, NULL)) {
+							res = 0;
+						}
 #else
-					struct statvfs fs;
-					memset(&fs, '\0', sizeof(fs));
-					res = statvfs(backup_directory, &fs);
-					if (res == 0) {
-						freespace = (uint64_t)fs.f_bavail * (uint64_t)fs.f_frsize;
-					}
+						struct statvfs fs;
+						memset(&fs, '\0', sizeof(fs));
+						res = statvfs(backup_directory, &fs);
+						if (res == 0) {
+							freespace = (uint64_t)fs.f_bavail * (uint64_t)fs.f_frsize;
+						}
 #endif
+					}
 					plist_t freespace_item = plist_new_uint(freespace);
 					mobilebackup2_send_status_response(mobilebackup2, res, NULL, freespace_item);
 					plist_free(freespace_item);
@@ -2930,7 +2936,7 @@ checkpoint:
 						plist_get_string_val(nn, &str);
 					}
 					if (error_code != 0) {
-						if (mb2_partial_was_successful() && (error_code == 205 || error_code == 104)) {
+						if (mb2_partial_was_successful() && (error_code == 205 || error_code == 104 || error_code == 105)) {
 							PRINT_VERBOSE(2, "Ignoring MBErrorDomain/%d due to partial backup completion.\n", error_code);
 							error_code = 0;
 							result_code = 0;
