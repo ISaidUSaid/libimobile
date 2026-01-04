@@ -472,6 +472,44 @@ static int mb2_partial_should_keep_file(const char *fname, struct mb2_partial_en
 	return 0;
 }
 
+static int mb2_partial_path_matches_or_parent(const char *path, const char *entry_path)
+{
+	size_t path_len = 0;
+
+	if (!path || !entry_path) {
+		return 0;
+	}
+
+	if (strcmp(path, entry_path) == 0) {
+		return 1;
+	}
+
+	path_len = strlen(path);
+	if (strncmp(entry_path, path, path_len) == 0 && entry_path[path_len] == '/') {
+		return 1;
+	}
+
+	return 0;
+}
+
+static int mb2_partial_path_related_to_targets(const char *path)
+{
+	if (!mb2_partial_mode_active) {
+		return 1;
+	}
+	if (!path) {
+		return 0;
+	}
+
+	for (size_t i = 0; i < mb2_partial_entry_count; i++) {
+		if (mb2_partial_entries[i].path &&
+			mb2_partial_path_matches_or_parent(path, mb2_partial_entries[i].path)) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
 static int mb2_partial_requirements_met(void)
 {
 	if (!mb2_partial_mode_active) {
@@ -1403,7 +1441,7 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 	uint32_t rlen;
 	uint32_t nlen = 0;
 	uint32_t r;
-	char buf[32768];
+	char buf[2097152];
 	char *fname = NULL;
 	char *dname = NULL;
 	char *bname = NULL;
@@ -1422,10 +1460,11 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 		plist_get_uint_val(node, &backup_total_size);
 	}
 	if (backup_total_size > 0) {
-		PRINT_VERBOSE(1, "Receiving files\n");
+		PRINT_VERBOSE(2, "Receiving files\n");
 	}
 
 	int last_keep_file = 0;
+	uint64_t last_progress = 0;
 
 	do {
 		errcode = 0;
@@ -1450,16 +1489,18 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 
 		struct mb2_partial_entry *partial_entry = NULL;
 		int keep_file = mb2_partial_should_keep_file(fname, &partial_entry);
-		PRINT_VERBOSE(1, "Partial backup candidate: domain='%s' path='%s' keep=%d\n",
+		PRINT_VERBOSE(3, "Partial backup candidate: domain='%s' path='%s' keep=%d\n",
 			dname ? dname : "(null)",
 			fname ? fname : "(null)",
 			keep_file);
 		if (!keep_file && mb2_partial_mode_active) {
-			PRINT_VERBOSE(2, "Partial backup: skipping %s\n", fname);
+			PRINT_VERBOSE(3, "Partial backup: skipping %s\n", fname);
 		}
 		last_keep_file = keep_file;
 
-		bname = string_build_path(backup_dir, fname, NULL);
+		if (keep_file) {
+			bname = string_build_path(backup_dir, fname, NULL);
+		}
 
 		if (fname != NULL) {
 			free(fname);
@@ -1490,7 +1531,6 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 		}
 
 		if (keep_file) {
-			remove_file(bname);
 			f = fopen(bname, "wb");
 			if (!f) {
 				errcode = errno_to_device_error(errno);
@@ -1524,7 +1564,10 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 				backup_real_size += blocksize;
 			}
 			if (backup_total_size > 0 && keep_file) {
-				print_progress(backup_real_size, backup_total_size);
+				if ((backup_real_size - last_progress) >= (4 * 1024 * 1024)) {
+					print_progress(backup_real_size, backup_total_size);
+					last_progress = backup_real_size;
+				}
 			}
 			if (quit_flag)
 				break;
@@ -1629,8 +1672,20 @@ static void mb2_handle_list_directory(mobilebackup2_client_t mobilebackup2, plis
 		return;
 	}
 
+	int allow = mb2_partial_path_related_to_targets(str);
 	char *path = string_build_path(backup_dir, str, NULL);
 	free(str);
+
+	if (!allow) {
+		plist_t empty = plist_new_dict();
+		mobilebackup2_error_t err = mobilebackup2_send_status_response(mobilebackup2, 0, NULL, empty);
+		plist_free(empty);
+		free(path);
+		if (err != MOBILEBACKUP2_E_SUCCESS) {
+			printf("Could not send status response, error %d\n", err);
+		}
+		return;
+	}
 
 	plist_t dirlist = plist_new_dict();
 
@@ -1688,8 +1743,18 @@ static void mb2_handle_make_directory(mobilebackup2_client_t mobilebackup2, plis
 	char *errdesc = NULL;
 	plist_get_string_val(dir, &str);
 
+	int allow = mb2_partial_path_related_to_targets(str);
 	char *newpath = string_build_path(backup_dir, str, NULL);
 	free(str);
+
+	if (!allow) {
+		free(newpath);
+		mobilebackup2_error_t err = mobilebackup2_send_status_response(mobilebackup2, 0, NULL, NULL);
+		if (err != MOBILEBACKUP2_E_SUCCESS) {
+			printf("Could not send status response, error %d\n", err);
+		}
+		return;
+	}
 
 	if (mkdir_with_parents(newpath, 0755) < 0) {
 		errdesc = strerror(errno);
@@ -2796,6 +2861,13 @@ checkpoint:
 								char *str = NULL;
 								plist_get_string_val(val, &str);
 								if (str) {
+									if (!mb2_partial_path_related_to_targets(key) &&
+										!mb2_partial_path_related_to_targets(str)) {
+										free(str);
+										free(key);
+										key = NULL;
+										continue;
+									}
 									char *newpath = string_build_path(backup_directory, str, NULL);
 									free(str);
 									char *oldpath = string_build_path(backup_directory, key, NULL);
@@ -2843,6 +2915,10 @@ checkpoint:
 							char *str = NULL;
 							plist_get_string_val(val, &str);
 							if (str) {
+								if (!mb2_partial_path_related_to_targets(str)) {
+									free(str);
+									continue;
+								}
 								const char *checkfile = strchr(str, '/');
 								int suppress_warning = 0;
 								if (checkfile) {
@@ -2885,20 +2961,27 @@ checkpoint:
 						plist_get_string_val(srcpath, &src);
 						plist_get_string_val(dstpath, &dst);
 						if (src && dst) {
-							char *oldpath = string_build_path(backup_directory, src, NULL);
-							char *newpath = string_build_path(backup_directory, dst, NULL);
-
-							PRINT_VERBOSE(1, "Copying '%s' to '%s'\n", src, dst);
-
-							/* check that src exists */
-							if ((stat(oldpath, &st) == 0) && S_ISDIR(st.st_mode)) {
-								mb2_copy_directory_by_path(oldpath, newpath);
-							} else if ((stat(oldpath, &st) == 0) && S_ISREG(st.st_mode)) {
-								mb2_copy_file_by_path(oldpath, newpath);
+							int do_copy = 1;
+							if (!mb2_partial_path_related_to_targets(src) &&
+								!mb2_partial_path_related_to_targets(dst)) {
+								do_copy = 0;
 							}
+							if (do_copy) {
+								char *oldpath = string_build_path(backup_directory, src, NULL);
+								char *newpath = string_build_path(backup_directory, dst, NULL);
 
-							free(newpath);
-							free(oldpath);
+								PRINT_VERBOSE(1, "Copying '%s' to '%s'\n", src, dst);
+
+								/* check that src exists */
+								if ((stat(oldpath, &st) == 0) && S_ISDIR(st.st_mode)) {
+									mb2_copy_directory_by_path(oldpath, newpath);
+								} else if ((stat(oldpath, &st) == 0) && S_ISREG(st.st_mode)) {
+									mb2_copy_file_by_path(oldpath, newpath);
+								}
+
+								free(newpath);
+								free(oldpath);
+							}
 						}
 						free(src);
 						free(dst);
