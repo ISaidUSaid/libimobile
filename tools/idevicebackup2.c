@@ -284,12 +284,13 @@ static const struct mb2_partial_file_spec mb2_partial_file_specs[] = {
 
 static void mb2_partial_emit_event(const char *remote_path, const char *local_path, struct mb2_partial_entry *entry)
 {
-	struct mb2_partial_file_spec anon_spec = { NULL, NULL, 0 };
+	struct mb2_partial_entry anon_entry;
 	if (!entry && remote_path) {
-		anon_spec.domain = "";
-		anon_spec.relative_path = remote_path;
-		anon_spec.required = 0;
-		entry = &anon_spec;
+		memset(&anon_entry, 0, sizeof(anon_entry));
+		anon_entry.path = (char*)remote_path;
+		anon_entry.is_target = 0;
+		anon_entry.target_group = -1;
+		entry = &anon_entry;
 	}
 	const struct mb2_partial_file_spec *spec = NULL;
 	if (entry && entry->is_target && entry->target_group >= 0) {
