@@ -1442,7 +1442,8 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 	uint32_t rlen;
 	uint32_t nlen = 0;
 	uint32_t r;
-	char buf[2097152];
+	char *buf = NULL;
+	size_t buf_size = 2097152;
 	char *fname = NULL;
 	char *dname = NULL;
 	char *bname = NULL;
@@ -1455,6 +1456,12 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 	char *errdesc = NULL;
 
 	if (!message || (plist_get_node_type(message) != PLIST_ARRAY) || plist_array_get_size(message) < 4 || !backup_dir) return 0;
+
+	buf = (char*)malloc(buf_size);
+	if (!buf) {
+		printf("ERROR: %s: could not allocate buffer\n", __func__);
+		return 0;
+	}
 
 	node = plist_array_get_item(message, 3);
 	if (plist_get_node_type(node) == PLIST_UINT) {
@@ -1547,10 +1554,10 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 			bdone = 0;
 			rlen = 0;
 			while (bdone < blocksize) {
-				if ((blocksize - bdone) < sizeof(buf)) {
+				if ((blocksize - bdone) < buf_size) {
 					rlen = blocksize - bdone;
 				} else {
-					rlen = sizeof(buf);
+					rlen = buf_size;
 				}
 				mobilebackup2_receive_raw(mobilebackup2, buf, rlen, &r);
 				if ((int)r <= 0) {
@@ -1650,6 +1657,9 @@ static int mb2_handle_receive_files(mobilebackup2_client_t mobilebackup2, plist_
 
 	if (dname != NULL)
 		free(dname);
+
+	if (buf != NULL)
+		free(buf);
 
 	plist_t empty_plist = plist_new_dict();
 	mobilebackup2_send_status_response(mobilebackup2, errcode, errdesc, empty_plist);
